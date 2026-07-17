@@ -13,6 +13,8 @@ import {
   Download,
   Check,
   FileText,
+  GitCompare,
+  X,
 } from 'lucide-react';
 import {
   type Cookie,
@@ -27,20 +29,33 @@ import { StatusBadge } from './StatusBadge';
 import { CookieTable } from './CookieTable';
 import { RecommendedActions } from './RecommendedActions';
 import { CategoryBar } from './CategoryBar';
-import { CookieDetailModal } from './CookieDetailModal';
+import { UploadZone } from './UploadZone';
 
 interface Props {
   result: ParseResult;
   onReset: () => void;
+  onCompareFile: (file: File) => void;
+  compareBusy: boolean;
+  compareError: string | null;
+  onClearCompareError: () => void;
+  onSelectCookie: (cookie: Cookie) => void;
 }
 
-export function Results({ result, onReset }: Props) {
+export function Results({
+  result,
+  onReset,
+  onCompareFile,
+  compareBusy,
+  compareError,
+  onClearCompareError,
+  onSelectCookie,
+}: Props) {
   const r = result.spreadsheetRow;
   const actions = recommendedActions(result);
   const ticketSummary = formatTicketSummary(result);
   const [copiedTsv, setCopiedTsv] = useState(false);
   const [copiedTicket, setCopiedTicket] = useState(false);
-  const [selectedCookie, setSelectedCookie] = useState<Cookie | null>(null);
+  const [compareOpen, setCompareOpen] = useState(false);
 
   const copyTsv = async () => {
     await navigator.clipboard.writeText(formatSpreadsheetTsv(r));
@@ -99,6 +114,21 @@ export function Results({ result, onReset }: Props) {
 
         <div className="flex flex-wrap gap-2">
           <button
+            onClick={() => {
+              onClearCompareError();
+              setCompareOpen((v) => !v);
+            }}
+            className={[
+              'inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-medium transition-colors shadow-sm',
+              compareOpen
+                ? 'bg-neutral-900 text-white hover:bg-neutral-800'
+                : 'border border-neutral-300 bg-white text-neutral-900 hover:bg-neutral-50',
+            ].join(' ')}
+          >
+            <GitCompare className="h-4 w-4" />
+            {compareOpen ? 'Cancel compare' : 'Compare with another report'}
+          </button>
+          <button
             onClick={copyTsv}
             className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-300 bg-white px-3.5 py-2 text-sm font-medium text-neutral-900 hover:bg-neutral-50 transition-colors shadow-sm"
           >
@@ -114,6 +144,55 @@ export function Results({ result, onReset }: Props) {
           </button>
         </div>
       </header>
+
+      {compareOpen ? (
+        <section className="mt-6">
+          <div className="rounded-2xl border border-neutral-200 bg-white overflow-hidden">
+            <div className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 border-b border-neutral-100 bg-neutral-50/60">
+              <div>
+                <p className="text-sm font-medium text-neutral-900">
+                  Upload another scan report for{' '}
+                  <span className="font-mono">
+                    {r.domain ?? 'this domain'}
+                  </span>
+                </p>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  The older report becomes "past", the newer one becomes
+                  "current" — we'll figure it out from the scan date.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  onClearCompareError();
+                  setCompareOpen(false);
+                }}
+                className="text-neutral-400 hover:text-neutral-900 rounded-md p-1 transition-colors"
+                aria-label="Close compare uploader"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="p-4 sm:p-5">
+              {compareBusy ? (
+                <div className="w-full rounded-xl border-2 border-dashed border-neutral-200 bg-white p-10 text-center">
+                  <div className="mx-auto h-10 w-10 rounded-full border-2 border-neutral-900 border-t-amber-400 animate-spin" />
+                  <p className="mt-4 text-sm text-neutral-600">
+                    Analyzing second report…
+                  </p>
+                </div>
+              ) : (
+                <UploadZone onFile={onCompareFile} disabled={compareBusy} />
+              )}
+              {compareError ? (
+                <div className="mt-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 px-4 py-2.5 text-sm">
+                  {compareError}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       {/* Metrics grid */}
       <section className="mt-6 grid grid-cols-2 lg:grid-cols-6 gap-3">
@@ -212,16 +291,8 @@ export function Results({ result, onReset }: Props) {
         <h2 className="text-base sm:text-lg font-semibold text-neutral-900 mb-3">
           All cookies
         </h2>
-        <CookieTable
-          cookies={result.cookies}
-          onSelect={(c) => setSelectedCookie(c)}
-        />
+        <CookieTable cookies={result.cookies} onSelect={onSelectCookie} />
       </section>
-
-      <CookieDetailModal
-        cookie={selectedCookie}
-        onClose={() => setSelectedCookie(null)}
-      />
     </div>
   );
 }
