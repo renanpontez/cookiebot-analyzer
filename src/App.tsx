@@ -1,10 +1,13 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Cookie, ShieldCheck, Github, Heart } from 'lucide-react';
-import { parseCookiebotHtml, type ParseResult } from './lib/parser';
+import { parseCookiebotHtml, type ParseResult, type Cookie as CookieRecord } from './lib/parser';
+import { compareReports } from './lib/compare';
 import { UploadZone } from './components/UploadZone';
 import { Results } from './components/Results';
+import { Comparison } from './components/Comparison';
+import { CookieDetailModal } from './components/CookieDetailModal';
 
-type View = 'idle' | 'parsing' | 'results' | 'error';
+type View = 'idle' | 'parsing' | 'results' | 'error' | 'comparison';
 
 const REPO_URL = 'https://github.com/renanpontez/cookiebot-analyzer';
 const AUTHOR_URL = 'https://martinzrenan.dev';
@@ -12,42 +15,100 @@ const AUTHOR_URL = 'https://martinzrenan.dev';
 export function App() {
   const [view, setView] = useState<View>('idle');
   const [result, setResult] = useState<ParseResult | null>(null);
+  const [compareResult, setCompareResult] = useState<ParseResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [compareError, setCompareError] = useState<string | null>(null);
+  const [comparingBusy, setComparingBusy] = useState(false);
+  const [selectedCookie, setSelectedCookie] = useState<CookieRecord | null>(null);
 
-  const handleFile = useCallback(async (file: File) => {
-    setView('parsing');
-    setError(null);
-    try {
-      const text = await file.text();
-      // small delay so the spinner is visible on tiny files
-      await new Promise((r) => setTimeout(r, 200));
-      const parsed = parseCookiebotHtml(text);
-      if (parsed.spreadsheetRow.totalTrackers === null) {
-        throw new Error(
-          "Couldn't find a Cookiebot scan report in that file. Make sure you exported the HTML from Cookiebot's dashboard.",
-        );
-      }
-      setResult(parsed);
-      setView('results');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to parse the file');
-      setView('error');
+  const parseFile = useCallback(async (file: File): Promise<ParseResult> => {
+    const text = await file.text();
+    await new Promise((r) => setTimeout(r, 150));
+    const parsed = parseCookiebotHtml(text);
+    if (parsed.spreadsheetRow.totalTrackers === null) {
+      throw new Error(
+        "Couldn't find a Cookiebot scan report in that file. Make sure you exported the HTML from Cookiebot's dashboard.",
+      );
     }
+    return parsed;
   }, []);
+
+  const handleFile = useCallback(
+    async (file: File) => {
+      setView('parsing');
+      setError(null);
+      try {
+        setResult(await parseFile(file));
+        setView('results');
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to parse the file');
+        setView('error');
+      }
+    },
+    [parseFile],
+  );
+
+  const handleCompareFile = useCallback(
+    async (file: File) => {
+      setComparingBusy(true);
+      setCompareError(null);
+      try {
+        const second = await parseFile(file);
+        setCompareResult(second);
+        setView('comparison');
+      } catch (e) {
+        setCompareError(
+          e instanceof Error ? e.message : 'Failed to parse the file',
+        );
+      } finally {
+        setComparingBusy(false);
+      }
+    },
+    [parseFile],
+  );
 
   const reset = useCallback(() => {
     setView('idle');
     setResult(null);
+    setCompareResult(null);
     setError(null);
+    setCompareError(null);
   }, []);
+
+  const exitComparison = useCallback(() => {
+    setCompareResult(null);
+    setCompareError(null);
+    setView('results');
+  }, []);
+
+  const comparison = useMemo(() => {
+    if (view !== 'comparison' || !result || !compareResult) return null;
+    return compareReports(result, compareResult);
+  }, [view, result, compareResult]);
 
   return (
     <div className="min-h-screen flex flex-col">
       <Header />
 
-      {view === 'results' && result ? (
+      {view === 'comparison' && comparison ? (
         <main className="flex-1">
-          <Results result={result} onReset={reset} />
+          <Comparison
+            comparison={comparison}
+            onExit={exitComparison}
+            onSelectCookie={(c) => setSelectedCookie(c)}
+          />
+        </main>
+      ) : view === 'results' && result ? (
+        <main className="flex-1">
+          <Results
+            result={result}
+            onReset={reset}
+            onCompareFile={handleCompareFile}
+            compareBusy={comparingBusy}
+            compareError={compareError}
+            onClearCompareError={() => setCompareError(null)}
+            onSelectCookie={(c) => setSelectedCookie(c)}
+          />
         </main>
       ) : (
         <main className="flex-1">
@@ -58,6 +119,11 @@ export function App() {
           />
         </main>
       )}
+
+      <CookieDetailModal
+        cookie={selectedCookie}
+        onClose={() => setSelectedCookie(null)}
+      />
 
       <Footer />
     </div>
