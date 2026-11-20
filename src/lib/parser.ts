@@ -173,8 +173,8 @@ function parseInt0(s: string): number | null {
   return m ? Number(m[0]) : null;
 }
 
-export function parseSummary(lines: string[]): ParseSummary {
-  const out: ParseSummary = {
+function emptySummary(): ParseSummary {
+  return {
     scanDate: null,
     domain: null,
     serverLocation: null,
@@ -190,6 +190,10 @@ export function parseSummary(lines: string[]): ParseSummary {
     },
     scanResultText: null,
   };
+}
+
+export function parseSummary(lines: string[]): ParseSummary {
+  const out = emptySummary();
 
   const intFields: Record<string, (n: number | null) => void> = {
     'Cookies, in total:': (n) => (out.totalCookies = n),
@@ -536,10 +540,176 @@ function aggregate(
 }
 
 // ---------------------------------------------------------------------------
+// Structured report (2026+): class-based markup, label and value share a line
+//
+//   .hero-domain          "Scan date: <strong>…</strong><br>Domain name: …"
+//   .scan-result-text     free text + .unclassified-warn
+//   .cat-title-row        .cat-name "Category: Necessary" + .cat-badge "25"
+//                         (also "New cookies (N)" / "Removed cookies (N)" /
+//                         "Unknown subdomains" — not categories, skipped)
+//   table.cookie-table    rows: [.cookie-name + <b>Label:</b> value…,
+//                                provider, type, expiry]
+//   .gcm-block            .gcm-summary-status / .gcm-sub-label + .gcm-sub-status
+// ---------------------------------------------------------------------------
+
+function isStructuredReport(raw: string): boolean {
+  return /class="cookie-table"/.test(raw) && /class="cat-title-row"/.test(raw);
+}
+
+function text(el: Element | null | undefined): string {
+  return (el?.textContent ?? '').replace(WS_RE, ' ').trim();
+}
+
+
+/**
+ * Collects `<b>Label:</b> value` pairs; a value runs until the next `<b>`.
+ * Bold text without a trailing colon (e.g. `<b>via</b> url` after Source)
+ * continues the previous field.
+ */
+function labeledFields(cell: Element): Map<string, string> {
+  const fields = new Map<string, string>();
+  let label: string | null = null;
+  for (const b of Array.from(cell.querySelectorAll('b'))) {
+    const parts: string[] = [];
+    for (let n = b.nextSibling; n && n.nodeName !== 'B'; n = n.nextSibling) {
+      parts.push(n.nodeName === 'BR' ? ' ' : (n.textContent ?? ''));
+    }
+    const value = parts.join('').replace(WS_RE, ' ').trim();
+    const bold = text(b);
+    if (bold.endsWith(':') || label === null) {
+      label = bold;
+      fields.set(label, value);
+    } else {
+      fields.set(label, `${fields.get(label) ?? ''} ${bold} ${value}`.trim());
+    }
+  }
+  return fields;
+}
+
+function parseStructuredSummary(doc: Document): ParseSummary {
+  const out = emptySummary();
+
+  const hero = doc.querySelector('.hero-domain');
+  if (hero) {
+    for (const strong of Array.from(hero.querySelectorAll('strong'))) {
+      const label = (strong.previousSibling?.textContent ?? '').trim();
+      const value = text(strong);
+      if (label === 'Scan date:') out.scanDate = value;
+      else if (label === 'Domain name:') out.domain = value;
+      else if (label === 'Server location:') out.serverLocation = value;
+      else if (label === 'Cookies, in total:') out.totalCookies = parseInt0(value);
+      else if (label === 'New cookies:') out.newCookies = parseInt0(value);
+      else if (label === 'Removed cookies:') out.removedCookies = parseInt0(value);
+    }
+  }
+
+  const scanResult = doc.querySelector('.scan-result-text');
+  if (scanResult) {
+    const lines = Array.from(scanResult.childNodes)
+      .map((n) => (n.textContent ?? '').trim())
+      .filter(Boolean);
+    out.scanResultText = lines[0] ?? null;
+    const m = /(\d+)\s+cookies?\s+(are|is)\s+unclassified/i.exec(text(scanResult));
+    if (m) out.unclassifiedCookiesFromSummary = Number(m[1]);
+  }
+
+  const gcm = doc.querySelector('.gcm-block');
+  if (gcm) {
+    const risk = /Risk Summary:\s*(.+)$/i.exec(text(gcm.querySelector('.gcm-summary-status')));
+    if (risk) out.googleConsentMode.riskSummary = risk[1];
+    for (const row of Array.from(gcm.querySelectorAll('.gcm-sub-row'))) {
+      const label = text(row.querySelector('.gcm-sub-label'));
+      const value = text(row.querySelector('.gcm-sub-status'));
+      if (label.startsWith('GCM consent parameters set as'))
+        out.googleConsentMode.gcmConsentDefault = value;
+      else if (label.startsWith('CMP to GCM consent signal'))
+        out.googleConsentMode.cmpToGcmActive = value;
+      else if (label.startsWith('Google trackers blocked prior consent'))
+        out.googleConsentMode.googleTrackersBlocked = value;
+    }
+  }
+
+  return out;
+}
+
+function parseStructuredRow(tr: Element, category: Category): Cookie | null {
+  const cells = Array.from(tr.children).filter((c) => c.tagName === 'TD');
+  if (cells.length < 4) return null;
+  const [main, provider, type, expiry] = cells;
+  const name = text(main.querySelector('.cookie-name'));
+  if (!name) return null;
+
+  const fields = labeledFields(main);
+  const field = (label: string): string | null => fields.get(label) || null;
+
+  let adequate: boolean | null = null;
+  if (main.querySelector('.adequacy-risk')) adequate = false;
+  else if (main.querySelector('.adequacy-ok')) adequate = true;
+
+  const sentTo = field('Data is sent to:');
+  // Older reports flagged violations by the label's presence alone; this
+  // layout prints an explicit Yes/No, where "No" means it fired pre-consent.
+  const blocked = fields.get('Blocked until accepted by user:');
+
+  return {
+    name,
+    provider: text(provider),
+    type: text(type),
+    expiry: text(expiry),
+    category,
+    firstFoundUrl: field('First found URL:'),
+    purpose: field('Cookie purpose description:'),
+    initiator: field('Initiator:'),
+    source: field('Source:'),
+    dataSentTo: sentTo ? sentTo.replace(/\s*\([^)]*\)\s*$/, '') || null : null,
+    adequate,
+    blockedPriorConsent: blocked !== undefined && !/^yes$/i.test(blocked),
+  };
+}
+
+function parseStructuredCookies(doc: Document): {
+  cookies: Cookie[];
+  declaredCounts: Record<Category, number>;
+} {
+  const cookies: Cookie[] = [];
+  const declaredCounts: Record<Category, number> = {
+    Necessary: 0,
+    Preferences: 0,
+    Statistics: 0,
+    Marketing: 0,
+    Unclassified: 0,
+  };
+
+  let current: Category | null = null;
+  for (const el of Array.from(doc.querySelectorAll('.cat-title-row, table.cookie-table'))) {
+    if (el.classList.contains('cat-title-row')) {
+      const m = /^Category:\s*(\w+)/.exec(text(el.querySelector('.cat-name')));
+      const cat = m?.[1];
+      current = cat && (CATEGORY_NAMES as readonly string[]).includes(cat) ? (cat as Category) : null;
+      if (current) declaredCounts[current] = parseInt0(text(el.querySelector('.cat-badge'))) ?? 0;
+      continue;
+    }
+    if (!current) continue;
+    for (const tr of Array.from(el.querySelectorAll('tbody > tr'))) {
+      const cookie = parseStructuredRow(tr, current);
+      if (cookie) cookies.push(cookie);
+    }
+  }
+
+  return { cookies, declaredCounts };
+}
+
+// ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
 
 export function parseCookiebotHtml(raw: string): ParseResult {
+  if (isStructuredReport(raw)) {
+    const doc = new DOMParser().parseFromString(raw, 'text/html');
+    const { cookies, declaredCounts } = parseStructuredCookies(doc);
+    return aggregate(parseStructuredSummary(doc), cookies, declaredCounts);
+  }
+
   const lines = htmlToLines(raw);
   const summary = parseSummary(lines);
   const { cookies, declaredCounts } = parseCookies(lines);
